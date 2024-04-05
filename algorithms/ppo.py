@@ -174,7 +174,7 @@ def create_ppo_train_object(env_name, config: dict = {}):
 
         rng, obs, env_state, done, episode_reward = jax.lax.while_loop(cond_func, step_env, (rng, obs, env_state, done, episode_reward))
 
-        return episode_reward, rng
+        return episode_reward
 
     def train_func(rng=rng):
         
@@ -266,11 +266,10 @@ def create_ppo_train_object(env_name, config: dict = {}):
                     actor_loss = -(ratio * norm_advantages - drift).mean()
                     return actor_loss, ratio
                 
-                actor_loss, ratio = jax.lax.cond(
-                    config.dpo_loss,
-                    ___dpo_actor_los,
-                    ___ppo_actor_los
-                )
+                if config.dpo_loss:
+                    actor_loss, ratio = ___dpo_actor_los()
+                else:
+                    actor_loss, ratio = ___ppo_actor_los() 
 
                 # Value loss - clipped version, think this can be improved. clip_coef for value ?
                 value_pred_clipped = trajectory_minibatch.value + (
@@ -288,7 +287,7 @@ def create_ppo_train_object(env_name, config: dict = {}):
                     + config.vf_coef * value_loss
                     - config.ent_coef * entropy
                 )
-                return total_loss, (actor_loss, value_loss, entropy, {"ratio_mean": ratio.mean(), "ratio_std": ratio.std()})
+                return total_loss, (actor_loss, value_loss, entropy)#, {"ratio_mean": ratio.mean(), "ratio_std": ratio.std()})
             
             def __update_over_minibatch(train_state: TrainState, minibatch):
                 trajectory_mb, advantages_mb, returns_mb = minibatch
@@ -354,7 +353,8 @@ def create_ppo_train_object(env_name, config: dict = {}):
             metric["loss_info"] = loss_info
             rng = update_state[-1]
 
-            eval_rewards, rng = eval_func(train_state, rng)
+            rng, eval_key = jax.random.split(rng)
+            eval_rewards = eval_func(train_state, eval_key)
             metric["eval_rewards"] = eval_rewards
 
             # Debugging mode from the copied logging wrapper
@@ -364,7 +364,7 @@ def create_ppo_train_object(env_name, config: dict = {}):
                     # timesteps = info["timestep"][info["returned_episode"]] * config.num_envs
                     # for t in range(len(timesteps)):
                     #     print(f"global step={timesteps[t]}, episodic return={return_values[t]}")
-                    print(f'timestep={info["timestep"][-1][0] * config.num_envs}, eval rewards={info["eval_rewards"]}')
+                    print(f'timestep={(info["timestep"][-1][0] * config.num_envs)[0]}, eval rewards={info["eval_rewards"]}')
 
                 jax.debug.callback(callback, metric)
 
