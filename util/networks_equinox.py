@@ -2,6 +2,7 @@ import jax
 import equinox as eqx
 from typing import List
 import distrax
+import jax.numpy as jnp
 
 class ActorNetwork(eqx.Module):
     """Actor network"""
@@ -19,14 +20,8 @@ class ActorNetwork(eqx.Module):
 
     def __call__(self, x):
         for layer in self.layers[:-1]:
-            x = jax.nn.tanh(layer(x))
+            x = jax.nn.relu(layer(x))
         return distrax.Categorical(logits=self.layers[-1](x))
-    
-        # def f(carry, input):
-        #     return jax.nn.relu(carry(input)), None
-        
-        # out, _ = jax.lax.scan(f, self.layers, x)
-        # return distrax.Categorical(logits=out)
     
 class CriticNetwork(eqx.Module):
     """
@@ -44,6 +39,11 @@ class CriticNetwork(eqx.Module):
         for i, feature in enumerate(hidden_layers[:-1]):
             self.layers.append(eqx.nn.Linear(feature, hidden_layers[i+1], key=keys[i]))
         self.layers.append(eqx.nn.Linear(hidden_layers[-1], 1, key=keys[-1]))
+
+    def __call__(self, x):
+        for layer in self.layers[:-1]:
+            x = jax.nn.relu(layer(x))
+        return jnp.squeeze(self.layers[-1](x), axis=-1)
 
 class Q_CriticNetwork(eqx.Module):
     """'
