@@ -1,5 +1,5 @@
 equinox
-# flax
+flax
 flashbax
 gymnax
 ipykernel

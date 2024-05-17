@@ -8,25 +8,40 @@ import flashbax
 import equinox as eqx
 import chex
 from typing import NamedTuple
+import matplotlib.pyplot as plt
 
 from util.wrappers import LogWrapper, FlattenObservationWrapper
 from util.networks_equinox import create_actor_critic_critic_network, Q_CriticNetwork, ActorNetwork
 
+class Alpha(eqx.Module):
+    ent_coef: jnp.ndarray
+
+    def __init__(self, ent_coef_init: float = 0.0):
+        self.ent_coef = jnp.array(ent_coef_init)
+
+    def __call__(self) -> jnp.ndarray:
+        return jnp.exp(self.ent_coef)
+
 @dataclass
 class SacConfig:
-    seed: int = 0
+    seed: int = 4
     num_envs: int = 4
-    total_timesteps: int = 2e6
+    total_timesteps: int = 5e6
     update_every: int = 1e3
     replay_buffer_size: int = 1e4
-    alpha: float = 0.2
+    train_batch_size: int = 256
+    alpha: float = 0.0 # is passed through an exponential function
+    learn_alpha: bool = False
+    target_entropy_scale = 0.98
     learning_rate: float = 2.5e-3
-    anneal_learning_rate: bool = True
-    gamma: float = 0.998
-    max_grad_norm: float = 0.5
+    anneal_learning_rate: bool = False
+    gamma: float = 0.99
+    max_grad_norm: float = 100.0
     debug: bool = False
+    tau: float = 0.95
 
-# Define a simple tuple to hold the state of the environment. This is the format we will use to store transitions in our buffer.
+# Define a simple tuple to hold the state of the environment. 
+# This is the format we will use to store transitions in our buffer.
 @chex.dataclass(frozen=True)
 class Transition:
     observation: chex.Array
@@ -40,18 +55,21 @@ class TrainState(NamedTuple):
     q_critic1: Q_CriticNetwork
     q_critic2: Q_CriticNetwork
     actor: ActorNetwork
+    alpha: Alpha
     q_critic1_target: Q_CriticNetwork
     q_critic2_target: Q_CriticNetwork
     actor_optimizer_state: optax.OptState
-    q_optimizer_state: optax.OptState
-
+    q1_optimizer_state: optax.OptState
+    q2_optimizer_state: optax.OptState
+    alpha_optimizer_state: optax.OptState
+        
 def create_train_object(
         env,
         env_params,
         config_params: dict = {}
 ):
     env = LogWrapper(env)
-    env = FlattenObservationWrapper(env)
+    # env = FlattenObservationWrapper(env)
     observation_space = env.observation_space(env_params)
     action_space = env.action_space(env_params)
     num_actions = action_space.n
@@ -75,12 +93,25 @@ def create_train_object(
         ),
     )
 
-    q_optimizer = optax.chain(
+    q1_optimizer = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
         optax.adam(
             learning_rate=linear_schedule if config.anneal_learning_rate else config.learning_rate,
             eps=1e-5
         ),
+    )
+
+    q2_optimizer = optax.chain(
+        optax.clip_by_global_norm(config.max_grad_norm),
+        optax.adam(
+            learning_rate=linear_schedule if config.anneal_learning_rate else config.learning_rate,
+            eps=1e-5
+        ),
+    )
+
+
+    alpha_optimzer = optax.adam(
+        learning_rate=config.learning_rate, eps=1e-5
     )
 
     # rng keys
@@ -91,39 +122,34 @@ def create_train_object(
     actor, q_critic1, q_critic2, q_critic1_target, q_critic2_target = create_actor_critic_critic_network(
         network_key, observation_space_shape, [64, 64], [64, 64], num_actions
     )
+    alpha = Alpha(config.alpha)
 
     actor_optimizer_state = actor_optimizer.init(actor)
-    q_optimizer_state = q_optimizer.init({
-        "q_critic1": q_critic1,
-        "q_critic2": q_critic2
-    })
+    q1_optimizer_state = q1_optimizer.init(q_critic1)
+    q2_optimizer_state = q2_optimizer.init(q_critic2)
+    alpha_optimizer_state = alpha_optimzer.init(alpha)
 
     train_state = TrainState(
         q_critic1=q_critic1,
         q_critic2=q_critic2,
         actor=actor,
+        alpha=alpha,
         q_critic1_target=q_critic1_target,
         q_critic2_target=q_critic2_target,
         actor_optimizer_state=actor_optimizer_state,
-        q_optimizer_state=q_optimizer_state
+        q1_optimizer_state=q1_optimizer_state,
+        q2_optimizer_state=q2_optimizer_state,
+        alpha_optimizer_state=alpha_optimizer_state
     )
-
-    # agent = {
-    #     "q_critic1": q_critic1,
-    #     "q_critic2": q_critic2,
-    #     "actor": actor,
-    #     "q_critic1_target": q_critic1_target,
-    #     "q_critic2_target": q_critic2_target
-    # }
     
     # setup buffer
     obs, dummy_env_state = env.reset(reset_key, env_params)
-    buffer = flashbax.make_flat_buffer(
+    buffer = flashbax.make_item_buffer(
         max_length=int(config.replay_buffer_size), 
-        min_length=int(config.update_every), 
-        sample_batch_size=int(config.update_every),
+        min_length=int(config.train_batch_size), 
+        sample_batch_size=int(config.train_batch_size),
         add_sequences=False,
-        add_batch_size=config.num_envs if config.num_envs > 1 else None,
+        add_batches=config.num_envs if config.num_envs > 1 else None,
     )
     dummy_action = action_space.sample(sample_key)
     obs_dummy, _, reward_dummy, done_dummy, _ = env.step(buffer_init_step_key, dummy_env_state, dummy_action, env_params)
@@ -138,14 +164,15 @@ def create_train_object(
 
     reset_key = jax.random.split(reset_key, config.num_envs)
     obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_key, env_params)
-        
+
+    target_entropy = -config.target_entropy_scale * jnp.log(1 / num_actions)
 
     def eval_func(train_state, rng):
 
         def step_env(carry):
             rng, obs, env_state, done, episode_reward = carry
             action_dist = train_state.actor(obs)
-            action = jnp.argmax(action_dist._logits) # deterministic
+            action = jnp.argmax(action_dist.logits) # deterministic
             rng, step_key = jax.random.split(rng)
             obs, env_state, reward, done, _ = env.step(step_key, env_state, action, env_params)
             episode_reward += reward
@@ -197,92 +224,108 @@ def create_train_object(
             return (train_state, env_state, next_obsv, buffer_state, rng), info
         
         def _update_step(runner_state):
+
+            @eqx.filter_jit
+            @eqx.filter_value_and_grad
+            def __sac_qnet_loss(params, batch):                
+                q_out = jax.vmap(params)(batch["observation"])
+                action_indices = jnp.arange(q_out.shape[0])
+                selected_q_values = q_out[action_indices, batch["action"]]
+                q_loss = jnp.mean((selected_q_values - target) ** 2)
+                return q_loss
             
             @eqx.filter_jit
-            @eqx.filter_grad
-            def __sac_qnet_loss(params, batch):
-
-                q1_out = jax.vmap(params["q_critic1"])(batch["observation"])
-                q2_out = jax.vmap(params["q_critic1"])(batch["observation"])
-                selected_q1_values = q1_out[index_array, next_action]
-                selected_q2_values = q2_out[index_array, next_action]
-                q1_loss = jnp.mean((selected_q1_values - target) ** 2)
-                q2_loss = jnp.mean((selected_q2_values - target) ** 2)
-
-                return q1_loss + q2_loss
-            
-            @eqx.filter_jit
-            @eqx.filter_grad
+            @eqx.filter_grad(has_aux=True)
             def __sac_actor_loss(params, batch):
-                
                 curr_action_dist = jax.vmap(params)(batch["observation"])
-                curr_action, curr_log_prob = curr_action_dist.sample_and_log_prob(seed=sample_key)
+                curr_action_probs = curr_action_dist.probs
+                curr_action_probs_log = jnp.log(curr_action_probs)  + 1e-8
                 q_1_outputs_curr = jax.vmap(new_critic1)(batch["observation"])
                 q_2_outputs_curr = jax.vmap(new_critic2)(batch["observation"])
-                # index into the array according to next_action
-                index_array = jnp.arange(q_1_outputs.shape[0])
-                selected_q1_values_curr = q_1_outputs_curr[index_array, curr_action]
-                selected_q2_values_curr = q_2_outputs_curr[index_array, curr_action]
-                q_values_curr = jnp.minimum(selected_q1_values_curr, selected_q2_values_curr)
+                q_values_curr = jnp.minimum(q_1_outputs_curr, q_2_outputs_curr)
 
-                loss = -jnp.mean(q_values_curr - config.alpha * curr_log_prob)
+                loss = -jnp.mean(curr_action_probs * (q_values_curr - (train_state.alpha() * curr_action_probs_log)))
 
-                return loss              
+                return loss, (curr_action_probs, curr_action_probs_log)
+            
+            @eqx.filter_jit
+            @eqx.filter_grad
+            def __sac_alpha_loss(params):
+                return -jnp.mean(jnp.log(params()) * ((action_probs * action_probs_log) + target_entropy))
 
             train_state, env_state, obsv, buffer_state, rng = runner_state
             rng, sample_key = jax.random.split(rng)
             batch = buffer.sample(buffer_state, sample_key)  # Sample
-            batch = batch.experience.first
-            
+            batch = batch.experience
 
+            # calculate q_target
             next_action_dist = jax.vmap(train_state.actor)(batch["next_observation"])
-            next_action, next_log_prob = next_action_dist.sample_and_log_prob(seed=sample_key)
-            q_1_outputs = jax.vmap(train_state.q_critic1_target)(batch["next_observation"])
-            q_2_outputs = jax.vmap(train_state.q_critic2_target)(batch["next_observation"])
-        	
-            # index into the array according to next_action
-            index_array = jnp.arange(q_1_outputs.shape[0])
-            selected_q1_values = q_1_outputs[index_array, next_action]
-            selected_q2_values = q_2_outputs[index_array, next_action]
+            next_action_probs = next_action_dist.probs
+            next_action_probs_log = jnp.log(next_action_probs) + 1e-8
+            
+            q_1_target_outputs = jax.vmap(train_state.q_critic1_target)(batch["next_observation"])
+            q_2_target_outputs = jax.vmap(train_state.q_critic2_target)(batch["next_observation"])
 
-            target = jnp.minimum(selected_q1_values, selected_q2_values) - config.alpha * next_log_prob
-            target = batch["reward"] + (1.0 - batch["done"]) * config.gamma * target
+            target = (next_action_probs * (jnp.minimum(q_1_target_outputs, q_2_target_outputs) - train_state.alpha() * next_action_probs_log)).sum(axis=-1)
+            target = batch["reward"] + ~batch["done"] * config.gamma * target
 
-            q_grads = __sac_qnet_loss(params={
-                "q_critic1": train_state.q_critic1,
-                "q_critic2": train_state.q_critic2
-            }, batch=batch)
-            updates, q_optimizer_state = q_optimizer.update(q_grads, train_state.q_optimizer_state)
-            critics = optax.apply_updates({
-                "q_critic1": train_state.q_critic1,
-                "q_critic2": train_state.q_critic2
-            }, updates)
-            new_critic1 = critics["q_critic1"]
-            new_critic2 = critics["q_critic2"]
+            # Updating Q networks
+            q_1_loss, q_1_grads = __sac_qnet_loss(params=train_state.q_critic1, batch=batch)
+            q_2_loss, q_2_grads = __sac_qnet_loss(params=train_state.q_critic2, batch=batch)
+            updates_q1, q1_optimizer_state = q1_optimizer.update(q_1_grads, train_state.q1_optimizer_state)
+            updates_q2, q2_optimizer_state = q2_optimizer.update(q_2_grads, train_state.q2_optimizer_state)
+            new_critic1 = optax.apply_updates(train_state.q_critic1, updates_q1)
+            new_critic2 = optax.apply_updates(train_state.q_critic2, updates_q2)
 
-            actor_grads = __sac_actor_loss(train_state.actor, batch)
+            # updates, q_optimizer_state = q_optimizer.update({
+            #     "q_critic1": q_1_grads,
+            #     "q_critic2": q_2_grads
+            # }, train_state.q_optimizer_state)            
+            # critics = optax.apply_updates({
+            #     "q_critic1": train_state.q_critic1,
+            #     "q_critic2": train_state.q_critic2
+            # }, updates)
+            # new_critic1 = critics["q_critic1"]
+            # new_critic2 = critics["q_critic2"]
+
+            # update target policy
+            new_q_critic1_target = jax.tree.map(lambda x, y: config.tau * x + (1 - config.tau) * y, train_state.q_critic1_target, new_critic1)
+            new_q_critic2_target = jax.tree.map(lambda x, y: config.tau * x + (1 - config.tau) * y, train_state.q_critic2_target, new_critic2)
+
+            # Updating the actor
+            actor_grads, (action_probs, action_probs_log) = __sac_actor_loss(params=train_state.actor, batch=batch)
             updates, actor_optimizer_state = actor_optimizer.update(actor_grads, train_state.actor_optimizer_state)
             new_actor = optax.apply_updates(train_state.actor, updates)
-            
-            # update target policy
-            tau = 0.005
-            new_q_critic1_target = jax.tree.map(lambda x, y: tau * x + (1 - tau) * y, train_state.q_critic1_target, new_critic1)
-            new_q_critic2_target = jax.tree.map(lambda x, y: tau * x + (1 - tau) * y, train_state.q_critic2_target, new_critic2)
+            # new_actor = train_state.actor # do not update
+
+            if config.learn_alpha:
+                # Updating alpha
+                alpha_grads = __sac_alpha_loss(params=train_state.alpha)
+                updates, alpha_optimizer_state = alpha_optimzer.update(alpha_grads, train_state.alpha_optimizer_state)
+                new_alpha = optax.apply_updates(train_state.alpha, updates)
+            else:
+                new_alpha = train_state.alpha
+                alpha_optimizer_state = train_state.alpha_optimizer_state
+
+            # jax.debug.callback(lambda x: print(x), new_alpha())
 
             # replace the named tuple with the updated values
             train_state = TrainState(
                 q_critic1=new_critic1,
                 q_critic2=new_critic2,
                 actor=new_actor,
+                alpha=new_alpha,
                 q_critic1_target=new_q_critic1_target,
                 q_critic2_target=new_q_critic2_target,
                 actor_optimizer_state=actor_optimizer_state,
-                q_optimizer_state=q_optimizer_state
+                q1_optimizer_state=q1_optimizer_state,
+                q2_optimizer_state=q2_optimizer_state,
+                alpha_optimizer_state=alpha_optimizer_state
             )
 
             runner_state = (train_state, env_state, obsv, buffer_state, rng)
 
-            return runner_state
+            return runner_state, (q_1_loss, q_2_loss)
 
         def train_step(runner_state, _):
 
@@ -291,13 +334,15 @@ def create_train_object(
                 _env_step, runner_state, None, config.update_every // config.num_envs
             )
 
-            runner_state = _update_step(runner_state)
+            runner_state, (q_1_loss, q_2_loss) = _update_step(runner_state)
 
             rng = runner_state[-1]
 
             rng, eval_key = jax.random.split(rng)
-            eval_rewards = eval_func(train_state, eval_key)
+            eval_rewards = eval_func(runner_state[0], eval_key)
             metric["eval_rewards"] = eval_rewards
+            metric["q_1_loss"] = q_1_loss
+            metric["q_2_loss"] = q_2_loss
 
             # Debugging mode from the copied logging wrapper
             if config.debug:
@@ -314,7 +359,6 @@ def create_train_object(
 
             
 
-            # runner_state = (agent, env_state, last_obs, rng)
             return runner_state, metric 
         
         rng, train_key = jax.random.split(rng)
@@ -352,7 +396,11 @@ if __name__ == "__main__":
     info = out["metrics"]
     return_values = info["returned_episode_returns"][info["returned_episode"]]
     timesteps = info["timestep"][info["returned_episode"]] * num_envs
-    import matplotlib.pyplot as plt
-    print(return_values.mean())
-    plt.plot(return_values)
-    plt.show()
+    # print(return_values.mean())
+    # plt.plot(return_values)
+    # plt.show()
+
+    # plt.plot(info["q_1_loss"], label="q_1_loss")
+    # plt.plot(info["q_2_loss"], label="q_2_loss")
+    # plt.legend()
+    # plt.show()
