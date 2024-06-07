@@ -16,6 +16,147 @@ from dataclasses import replace
 from util.wrappers import LogWrapper, FlattenObservationWrapper
 from util.networks_equinox import create_actor_critic_network
 
+def make_HiPPO_legs(N):
+    B = jnp.sqrt(1 + 2 * jnp.arange(N))
+    A = B[:, jnp.newaxis] * B[jnp.newaxis, :]
+    A = jnp.tril(A) - jnp.diag(jnp.arange(N))
+    return -A, B
+
+def discretize(A, B, C, step):
+    I = jnp.eye(A.shape[0])
+    BL = jnp.linalg.inv(I - (step / 2.0) * A)
+    Ab = BL @ (I + (step / 2.0) * A)
+    Bb = (BL * step) @ B
+    return Ab, Bb, C
+
+class LinearStateSpaceLayer(eqx.Module):
+    """
+        State space layer initialized with the hippo matrix
+    """
+    A: chex.Array
+    B: chex.Array
+    C: chex.Array
+    # D: Array # this is zero
+
+    # log_step: float = eqx.field(static=True)
+    hidden_size: int = eqx.field(static=True)
+    cnn_mode: bool = eqx.field(static=True)
+    
+    def __init__(self, key, hidden_size):
+        c_key, step_key = jax.random.split(key, 2)
+        self.A, self.B = make_HiPPO_legs(hidden_size)
+        self.B = self.B[:, jnp.newaxis]
+        self.C = jax.random.normal(c_key, (1, hidden_size))
+        # self.D = jnp.zeros((hidden_size, out_size))
+
+        # Step parameter
+        # self.log_step = jax.random.uniform(step_key, (1,)) * (
+        #     jnp.log(0.1) - jnp.log(0.01)
+        # ) + jnp.log(0.01)
+        # self.log_step = jnp.log()
+
+        self.hidden_size = hidden_size
+        self.cnn_mode = False
+
+    def __call__(self, in_x, hidden_state, done=False, **kwargs):
+        # step = jnp.exp(self.log_step)
+        step = 1.0 / in_x.shape[0]
+        A, B, C = discretize(self.A, self.B, self.C, step=step)
+
+        if not self.cnn_mode:
+            def step_through_time(h, x):
+                h_new = jnp.add(
+                    A @ h,
+                    B @ x
+                )
+                return h_new, C @ h_new 
+            new_hidden_state, output = jax.lax.scan(
+                step_through_time, 
+                hidden_state,
+                in_x[:, jnp.newaxis],
+            )
+
+        else:
+            def K_conv(L):
+                return jnp.array([
+                    (C @ jnp.linalg.matrix_power(A, l) @ B).reshape() 
+                    for l in range(L)
+                ])
+            
+            def causal_convolution(input, K, nofft=False):
+                if nofft:
+                    return jnp.convolve(input, K, mode="full")[: input.shape[0]]
+                else:
+                    assert K.shape[0] == input.shape[0]
+                    xd = jnp.fft.rfft(jnp.pad(input, (0, K.shape[0])))
+                    Kd = jnp.fft.rfft(jnp.pad(K, (0, input.shape[0])))
+                    out = xd * Kd
+                    return jnp.fft.irfft(out)[: input.shape[0]]
+            
+            K = K_conv(1)
+            output = causal_convolution(in_x, K, nofft=True)
+            new_hidden_state = None
+
+        return output.squeeze(), new_hidden_state
+
+class RecurrentActorCritics(eqx.Module):
+    """
+        Recurrent Actor-Critic networks
+    """
+    shared_layers: list
+    actor_layers: list
+    critic_layers: list
+
+    def __init__(self, key, in_shape, num_env_actions):
+        keys = jax.random.split(key, 4)
+        self.shared_layers = [
+            eqx.nn.Linear(in_shape, 128, key=keys[0]),
+            # eqx.nn.Linear(128, 128, key=keys[1])
+            LinearStateSpaceLayer(keys[1], 128)
+        ]
+        self.actor_layers = [
+            # eqx.nn.Linear(128, 128, key=keys[2]),
+            eqx.nn.Linear(128, num_env_actions, key=keys[2])
+        ]
+        self.critic_layers = [
+            # eqx.nn.Linear(128, 128, key=keys[2]),
+            eqx.nn.Linear(128, 1, key=keys[3])
+        ]
+
+    def __call__(self, x, hidden_state, done):
+        shared = jax.nn.selu(self.shared_layers[0](x))
+        shared, hidden_state = self.shared_layers[1](shared, hidden_state, done)
+        shared = jax.nn.selu(shared)
+
+        actor = shared
+        for layer in self.actor_layers[:-1]:
+            actor = jax.nn.selu(layer(actor))
+        actor_out = self.actor_layers[-1](actor)
+
+        critic = shared
+        for layer in self.critic_layers[:-1]:
+            critic = jax.nn.selu(layer(critic))
+        critic_out = self.critic_layers[-1](critic)
+
+        return distrax.Categorical(logits=actor_out), critic_out.squeeze(), hidden_state
+
+    def call_on_trace(self, x, hidden_state, done):
+        shared = jax.nn.selu(jax.vmap(self.shared_layers[0])(x))
+        shared, hidden_state = jax.vmap(self.shared_layers[1], in_axes=(0, None))(shared.T, hidden_state, done)
+        shared = jax.nn.selu(shared.T)
+
+        actor = shared
+        for layer in self.actor_layers[:-1]:
+            actor = jax.nn.selu(layer(actor))
+        actor_out = jax.vmap(self.actor_layers[-1])(actor)
+
+        critic = shared
+        for layer in self.critic_layers[:-1]:
+            critic = jax.nn.selu(layer(critic))
+        critic_out = jax.vmap(self.critic_layers[-1])(critic)
+
+        return distrax.Categorical(logits=actor_out), critic_out.squeeze(), hidden_state
+
 @chex.dataclass(frozen=True)
 class PPOConfig:
     learning_rate: float = 2.5e-4
@@ -30,7 +171,7 @@ class PPOConfig:
 
     total_timesteps: int = 5e6
     num_envs: int = 6
-    num_steps: int = 128 # steps per environment
+    num_steps: int = 64 # steps per environment
     num_minibatches: int = 4 # Number of mini-batches
     update_epochs: int = 4 # K epochs to update the policy
     # to be filled in runtime:
@@ -56,8 +197,7 @@ class Transition:
     info: chex.Array
 
 class TrainState(NamedTuple):
-    actor: eqx.Module
-    critic: eqx.Module
+    actor_critic: eqx.Module
     optimizer_state: optax.OptState
 
 # Jit the returned function, not this function
@@ -91,13 +231,14 @@ def create_ppo_train_object(
     rng, network_key, reset_key = jax.random.split(rng, 3)
 
     # networks
-    actor, critic = create_actor_critic_network(
-        key=network_key, 
-        in_shape=observation_space.shape[0],
-        actor_features=[64, 64], 
-        critic_features=[64, 64], 
-        num_env_actions=num_actions
-    )
+    # actor, critic = create_actor_critic_network(
+    #     key=network_key, 
+    #     in_shape=observation_space.shape[0],
+    #     actor_features=[64, 64], 
+    #     critic_features=[64, 64], 
+    #     num_env_actions=num_actions
+    # )
+    actor_critic = RecurrentActorCritics(network_key, observation_space.shape[0], num_actions)
 
     # optimizer
     def linear_schedule(count):
@@ -114,14 +255,10 @@ def create_ppo_train_object(
             eps=1e-5
         ),
     )
-    optimizer_state = optimizer.init({
-        "actor": actor,
-        "critic": critic
-    })
+    optimizer_state = optimizer.init(actor_critic)
 
     train_state = TrainState(
-        actor=actor,
-        critic=critic,
+        actor_critic=actor_critic,
         optimizer_state=optimizer_state
     )
 
@@ -132,24 +269,30 @@ def create_ppo_train_object(
     def eval_func(train_state, rng):
 
         def step_env(carry):
-            rng, obs, env_state, done, episode_reward = carry
-            action_dist = train_state.actor(obs)
-            action = jnp.argmax(action_dist.logits) # deterministic
-            rng, step_key = jax.random.split(rng)
+            rng, obs, env_state, done, hidden_state, episode_reward = carry
+            rng, action_key, step_key = jax.random.split(rng, 3)
+            action_dist, _, hidden_state = train_state.actor_critic(obs, hidden_state, done)
+            action = action_dist.sample(seed=action_key)
+            # action = jnp.argmax(action_dist.logits) # deterministic
             obs, env_state, reward, done, _ = env.step(step_key, env_state, action, env_params)
             episode_reward += reward
-            return (rng, obs, env_state, done, episode_reward)
+            return (rng, obs, env_state, done, hidden_state, episode_reward)
         
         def cond_func(carry):
-            _, _, _, done, _ = carry
+            _, _, _, done, _, _ = carry
             return jnp.logical_not(done)
         
         rng, reset_key = jax.random.split(rng)
         obs, env_state = env.reset(reset_key, env_params)
         done = False
         episode_reward = 0.0
+        hidden_state = jnp.zeros((128,))
 
-        rng, obs, env_state, done, episode_reward = jax.lax.while_loop(cond_func, step_env, (rng, obs, env_state, done, episode_reward))
+        rng, obs, env_state, done, hidden_state, episode_reward = jax.lax.while_loop(
+            cond_func, 
+            step_env, 
+            (rng, obs, env_state, done, hidden_state, episode_reward)
+        )
 
         return episode_reward
 
@@ -158,12 +301,12 @@ def create_ppo_train_object(
         # functions prepended with _ are called in jax.lax.scan of train_step
 
         def _env_step(runner_state, _):
-            train_state, env_state, last_obs, rng = runner_state
+            train_state, env_state, last_obs, last_done, h_state, rng = runner_state
             rng, sample_key, step_key = jax.random.split(rng, 3)
 
             # select an action
-            action_dist = jax.vmap(train_state.actor)(last_obs)
-            value = jax.vmap(train_state.critic)(last_obs)
+            action_dist, value, h_state = jax.vmap(train_state.actor_critic)(last_obs, h_state, last_done)
+            # value = jax.vmap(train_state.critic)(last_obs)
             action, log_prob = action_dist.sample_and_log_prob(seed=sample_key)
 
             # take a step in the environment
@@ -172,7 +315,6 @@ def create_ppo_train_object(
             obsv, env_state, reward, done, info = jax.vmap(
                 env.step, in_axes=(0, 0, 0, None)
             )(step_key, env_state, action, env_params)
-
 
             # Build a single transition. Jax.lax.scan will build the batch
             # returning num_steps transitions.
@@ -186,7 +328,7 @@ def create_ppo_train_object(
                 info=info
             )
 
-            runner_state = (train_state, env_state, obsv, rng)
+            runner_state = (train_state, env_state, obsv, done, h_state, rng)
             return runner_state, transition
         
         def _calculate_gae(gae_and_next_value, transition):
@@ -204,11 +346,10 @@ def create_ppo_train_object(
             """ Do one epoch of update"""
 
             @eqx.filter_value_and_grad(has_aux=True)
-            def __ppo_los_fn(params, trajectory_minibatch, advantages, returns):
-                action_dist = jax.vmap(params["actor"])(trajectory_minibatch.observation)
+            def __ppo_los_fn(params, trajectory_minibatch, advantages, returns, hidden_state):
+                action_dist, value, _ = jax.vmap(params.call_on_trace)(trajectory_minibatch.observation, hidden_state, trajectory_minibatch.done)
                 log_prob = action_dist.log_prob(trajectory_minibatch.action)
                 entropy = action_dist.entropy().mean()
-                value = jax.vmap(params["critic"])(trajectory_minibatch.observation)
 
                 def ___ppo_actor_los():
                     # actor loss 
@@ -270,34 +411,26 @@ def create_ppo_train_object(
                 return total_loss, (actor_loss, value_loss, entropy)
             
             def __update_over_minibatch(train_state: TrainState, minibatch):
-                trajectory_mb, advantages_mb, returns_mb = minibatch
-                (total_loss, _), grads = __ppo_los_fn({
-                        "actor": train_state.actor,
-                        "critic": train_state.critic
-                    }, trajectory_mb, advantages_mb, returns_mb
+                trajectory_mb, advantages_mb, returns_mb, initial_hidden_state = minibatch
+                (total_loss, _), grads = __ppo_los_fn(
+                    train_state.actor_critic, trajectory_mb, advantages_mb, returns_mb, initial_hidden_state
                 )
                 updates, optimizer_state = optimizer.update(grads, train_state.optimizer_state)
-                new_networks = optax.apply_updates({
-                    "actor": train_state.actor,
-                    "critic": train_state.critic
-                }, updates)
+                new_networks = optax.apply_updates(train_state.actor_critic, updates)
                 train_state = TrainState(
-                    actor=new_networks["actor"],
-                    critic=new_networks["critic"],
+                    actor_critic=new_networks,
                     optimizer_state=optimizer_state
                 )
                 return train_state, total_loss
             
-            train_state, trajectory_batch, advantages, returns, rng = update_state
+            train_state, trajectory_batch, advantages, returns, initial_hidden_state, rng = update_state
             rng, key = jax.random.split(rng)
 
-            batch_idx = jax.random.permutation(key, config.batch_size)
+            batch_idx = jax.random.permutation(key, config.num_envs)
             batch = (trajectory_batch, advantages, returns)
-            
-            # reshape (flatten over first dimension)
-            batch = jax.tree_util.tree_map(
-                lambda x: x.reshape((config.batch_size,) + x.shape[2:]), batch
-            )
+            batch = jax.tree_util.tree_map(lambda x: x.swapaxes(0, 1), batch)
+            batch = (batch[0], batch[1], batch[2], initial_hidden_state)
+
             # take from the batch in a new order (the order of the randomized batch_idx)
             shuffled_batch = jax.tree_util.tree_map(
                 lambda x: jnp.take(x, batch_idx, axis=0), batch
@@ -306,14 +439,17 @@ def create_ppo_train_object(
             minibatches = jax.tree_util.tree_map(
                 lambda x: x.reshape((config.num_minibatches, -1) + x.shape[1:]), shuffled_batch
             )
+
             # update over minibatches
             train_state, total_loss = jax.lax.scan(
                 __update_over_minibatch, train_state, minibatches
             )
-            update_state = (train_state, trajectory_batch, advantages, returns, rng)
+            update_state = (train_state, trajectory_batch, advantages, returns, initial_hidden_state, rng)
             return update_state, total_loss
 
         def train_step(runner_state, _):
+
+            _, _, _, _, initial_hidden_state, _ = runner_state
 
             # Do rollout of single trajactory
             runner_state, trajectory_batch = jax.lax.scan(
@@ -321,8 +457,8 @@ def create_ppo_train_object(
             )
 
             # calculate gae
-            train_state, env_state, last_obs, rng = runner_state
-            last_value = jax.vmap(train_state.critic)(last_obs)
+            train_state, env_state, last_obs, last_done, new_hidden_state, rng = runner_state
+            _, last_value, _ = jax.vmap(train_state.actor_critic)(last_obs, new_hidden_state, last_done)
             _, (advantages, returns) = jax.lax.scan(
                 _calculate_gae,
                 (jnp.zeros_like(last_value), last_value),
@@ -332,7 +468,7 @@ def create_ppo_train_object(
             )
     
             # Do update epochs
-            update_state = (train_state, trajectory_batch, advantages, returns, rng)
+            update_state = (train_state, trajectory_batch, advantages, returns, initial_hidden_state, rng)
             update_state, loss_info = jax.lax.scan(
                 _update_epoch, update_state, None, config.update_epochs
             )
@@ -359,11 +495,13 @@ def create_ppo_train_object(
 
             
 
-            runner_state = (train_state, env_state, last_obs, rng)
+            runner_state = (train_state, env_state, last_obs, last_done, new_hidden_state, rng)
             return runner_state, metric 
 
         rng, key = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, key)
+        initial_hidden_state = jnp.zeros((config.num_envs, 128))
+        initial_done = jnp.zeros((config.num_envs,))
+        runner_state = (train_state, env_state, obsv, initial_done, initial_hidden_state, key)
         runner_state, metrics = jax.lax.scan(
             train_step, runner_state, None, config.num_iterations
         )

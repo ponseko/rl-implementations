@@ -1,8 +1,43 @@
 import jax
 import equinox as eqx
-from typing import List
+from typing import List, Optional
+from chex import Array
 import distrax
 import jax.numpy as jnp
+
+def make_HiPPO(N):
+    P = jnp.sqrt(1 + 2 * jnp.arange(N))
+    A = P[:, jnp.newaxis] * P[jnp.newaxis, :]
+    A = jnp.tril(A) - jnp.diag(jnp.arange(N))
+    return -A
+
+class StateSpaceModel(eqx.Module):
+    """
+        State space model initialized with the hippo matrix
+    """
+    A: Array
+    B: Array
+    C: Array
+    bias: Optional[Array]
+    bias_n: Optional[Array]
+    input_size: int = eqx.field(static=True)
+    hidden_size: int = eqx.field(static=True)
+    use_bias: bool = eqx.field(static=True)
+    
+    def __init__(self, key, in_shape, hidden_size, out_shape):
+        keys = jax.random.split(key, 3)
+        self.A = make_HiPPO(hidden_size)
+        self.B = make_HiPPO(hidden_size)
+        self.C = jax.random.uniform(keys[1], (out_shape, in_shape))
+        self.hidden_state = jax.random.normal(keys[2], (in_shape,))
+
+    def __call__(self, h, x):
+        h_new = jnp.add(
+            self.A @ h,
+            self.B @ x
+        )
+        return self.C @ h_new, h_new
+        
 
 class ActorNetwork(eqx.Module):
     """Actor network"""

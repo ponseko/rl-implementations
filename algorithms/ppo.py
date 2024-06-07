@@ -54,7 +54,7 @@ class PPOParams:
     """the maximum norm for the gradient clipping"""
     num_envs: int = 4
     """the number of environments"""
-    seed: jax.dtypes.prng_key = jax.random.PRNGKey(0)
+    seed: int = 0
     """the seed for the pseudo-random number generator"""
     debug: bool = False
     """Toggles printing evaluation metrics during training"""    
@@ -116,7 +116,7 @@ def create_ppo_train_object(env_name, config: dict = {}):
     )
 
     # rng keys
-    rng = config.seed
+    rng = jax.random.PRNGKey(config.seed)
     rng, shared_key, actor_key, critic_key, sample_key = jax.random.split(rng, 5)
 
     shared_params = shared.init(shared_key, jnp.array([observation_space.sample(sample_key)]))
@@ -157,7 +157,7 @@ def create_ppo_train_object(env_name, config: dict = {}):
             rng, obs, env_state, done, episode_reward = carry
             hidden = shared.apply(train_state.params["params"].shared_params, obs)
             logits = actor.apply(train_state.params["params"].actor_params, hidden)
-            action = jnp.argmax(logits) # deterministic
+            action = jnp.argmax(logits.logits) # deterministic
             rng, step_key = jax.random.split(rng)
             obs, env_state, reward, done, _ = env.step(step_key, env_state, action, env_params)
             episode_reward += reward
@@ -186,7 +186,7 @@ def create_ppo_train_object(env_name, config: dict = {}):
             # select an action
             hidden = shared.apply(train_state.params["params"].shared_params, last_obs)
             logits = actor.apply(train_state.params["params"].actor_params, hidden)
-            logits_dist = distrax.Categorical(logits=logits)
+            logits_dist = logits # distrax.Categorical(logits=logits)
             rng, key = jax.random.split(rng)
             action, log_prob = logits_dist.sample_and_log_prob(seed=key)
             value = critic.apply(train_state.params["params"].critic_params, hidden)
@@ -210,6 +210,7 @@ def create_ppo_train_object(env_name, config: dict = {}):
         
         def _calculate_gae(gae_and_next_value, transition):
             gae, next_value = gae_and_next_value
+            print(gae_and_next_value)
             value, reward, done = (
                 transition.value,
                 transition.reward,
@@ -224,7 +225,7 @@ def create_ppo_train_object(env_name, config: dict = {}):
             def __ppo_los_fn(params, trajectory_minibatch, advantages, returns):
                 hidden = shared.apply(params["params"].shared_params, trajectory_minibatch.observation)
                 logits = actor.apply(params["params"].actor_params, hidden)
-                logits_dist = distrax.Categorical(logits=logits)
+                logits_dist = logits # distrax.Categorical(logits=logits)
                 log_prob = logits_dist.log_prob(trajectory_minibatch.action)
                 entropy = logits_dist.entropy().mean()
                 value = critic.apply(params["params"].critic_params, hidden)
@@ -410,6 +411,7 @@ if __name__ == "__main__":
         env_name, 
         config={
             "debug": True,
+            "num_envs": 6
         }
     )
     train_func_jit = jax.jit(train_func, backend="cpu")

@@ -57,6 +57,46 @@ class FlattenObservationWrapper(GymnaxWrapper):
         obs, state, reward, done, info = self._env.step(key, state, action, params)
         obs = jnp.reshape(obs, (-1,))
         return obs, state, reward, done, info
+    
+
+@struct.dataclass
+class MiniLogEnvState:
+    env_state: environment.EnvState
+    timestep: int
+
+
+class MiniLogWrapper(GymnaxWrapper):
+    """Log the episode returns and lengths."""
+
+    def __init__(self, env: environment.Environment):
+        super().__init__(env)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def reset(
+        self, key: chex.PRNGKey, params: Optional[environment.EnvParams] = None
+    ) -> Tuple[chex.Array, MiniLogEnvState]:
+        obs, env_state = self._env.reset(key, params)
+        num_of_zeros = MiniLogEnvState.__dataclass_fields__.__len__() - 1
+        state = MiniLogEnvState(env_state, *[0]*num_of_zeros)
+        return obs, state
+
+    @partial(jax.jit, static_argnums=(0,))
+    def step(
+        self,
+        key: chex.PRNGKey,
+        state: environment.EnvState,
+        action: Union[int, float],
+        params: Optional[environment.EnvParams] = None,
+    ) -> Tuple[chex.Array, MiniLogEnvState, float, bool, dict]:
+        obs, env_state, reward, done, info = self._env.step(
+            key, state.env_state, action, params
+        )
+        state = MiniLogEnvState(
+            env_state=env_state,
+            timestep=state.timestep + 1,
+        )
+        info["timestep"] = state.timestep
+        return obs, state, reward, done, info
 
 
 @struct.dataclass

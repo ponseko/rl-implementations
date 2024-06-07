@@ -9,7 +9,7 @@ import chex
 from typing import NamedTuple
 import matplotlib.pyplot as plt
 
-from util.wrappers import LogWrapper, FlattenObservationWrapper
+from util.wrappers import LogWrapper, FlattenObservationWrapper, MiniLogWrapper
 from util.networks_equinox import create_actor_critic_critic_network, Q_CriticNetwork, ActorNetwork
 
 class Alpha(eqx.Module):
@@ -26,10 +26,11 @@ class SacConfig:
     seed: int = 4
     num_envs: int = 4
     total_timesteps: int = 1e6
-    update_every: int = 2e2
-    replay_buffer_size: int = 1e4
-    train_batch_size: int = 64
-    alpha: float = 0.0 # is passed through an exponential function
+    update_every: int = 200
+    replay_buffer_size: int = 1000  # in number of timesteps (NOT SEQUENCES)
+    train_batch_size: int = 64      # number of sequences to pull from buffer
+    sample_sequence_length: int = 1 # number of steps per sequence to pull from buffer
+    alpha: float = 0.0              # is passed through an exponential function (ignored if learn_alpha is True)
     learn_alpha: bool = True
     target_entropy_scale_start = .5 # is linearly annealed to 0.01
     learning_rate: float = 2.5e-3
@@ -68,7 +69,7 @@ def create_train_object(
         env_params,
         config_params: dict = {}
 ):
-    env = LogWrapper(env)
+    env = MiniLogWrapper(env)
     # env = FlattenObservationWrapper(env)
     observation_space = env.observation_space(env_params)
     action_space = env.action_space(env_params)
@@ -110,7 +111,8 @@ def create_train_object(
     )
 
     alpha_optimzer = optax.adam(
-        learning_rate=config.learning_rate, eps=1e-5
+        learning_rate=2.5e-4,
+        eps=1e-5
     )
 
     # rng keys
@@ -143,12 +145,14 @@ def create_train_object(
     
     # setup buffer
     obs, dummy_env_state = env.reset(reset_key, env_params)
-    buffer = flashbax.make_item_buffer(
-        max_length=int(config.replay_buffer_size), 
-        min_length=int(config.train_batch_size), 
-        sample_batch_size=int(config.train_batch_size),
-        add_sequences=False,
-        add_batches=config.num_envs if config.num_envs > 1 else None,
+    buffer = flashbax.make_trajectory_buffer(
+        max_size=config.replay_buffer_size,
+        # max_length_time_axis=config.replay_buffer_size,
+        min_length_time_axis=config.train_batch_size,
+        sample_batch_size=config.train_batch_size,
+        add_batch_size=config.num_envs,
+        sample_sequence_length=config.sample_sequence_length,
+        period=1
     )
     dummy_action = action_space.sample(sample_key)
     obs_dummy, _, reward_dummy, done_dummy, dummy_info = env.step(buffer_init_step_key, dummy_env_state, dummy_action, env_params)
@@ -218,30 +222,30 @@ def create_train_object(
                 done=done
             )
 
-            # add to buffer
-            buffer_state = buffer.add(buffer_state, transition)
+            # Adding trajectories, so do not add to buffer; return transition instead
 
-            return (train_state, env_state, next_obsv, buffer_state, rng), info
+            return (train_state, env_state, next_obsv, buffer_state, rng), transition
         
         def _update_step(runner_state):
 
             @eqx.filter_jit
             @eqx.filter_value_and_grad
             def __sac_qnet_loss(params, batch):                
-                q_out = jax.vmap(params)(batch["observation"])
-                idx1 = jnp.arange(q_out.shape[0])
-                selected_q_values = q_out[idx1, batch["action"]]
+                q_out = jax.vmap(jax.vmap(params))(batch["observation"])
+                idx1, idx2 = jnp.indices((q_out.shape[0], q_out.shape[1]))
+                selected_q_values = q_out[idx1, idx2, batch["action"]]
                 q_loss = jnp.mean((selected_q_values - target) ** 2)
                 return q_loss
             
             @eqx.filter_jit
             @eqx.filter_grad(has_aux=True)
             def __sac_actor_loss(params, batch):
-                curr_action_dist = jax.vmap(params)(batch["observation"])
+                curr_action_dist = jax.vmap(jax.vmap(params))(batch["observation"])
                 curr_action_probs = curr_action_dist.probs
                 curr_action_probs_log = jnp.log(curr_action_probs + 1e-8)
-                q_1_outputs_curr = jax.vmap(new_critic1)(batch["observation"])
-                q_2_outputs_curr = jax.vmap(new_critic2)(batch["observation"])
+                q_1_outputs_curr = jax.vmap(jax.vmap(new_critic1))(batch["observation"])
+                q_2_outputs_curr = jax.vmap(jax.vmap(new_critic2))(batch["observation"])
+
                 q_values_curr = jnp.minimum(q_1_outputs_curr, q_2_outputs_curr)
 
                 loss = -jnp.mean(curr_action_probs * (q_values_curr - (train_state.alpha() * curr_action_probs_log)))
@@ -271,12 +275,12 @@ def create_train_object(
             batch = batch.experience
 
             # calculate q_target
-            next_action_dist = jax.vmap(train_state.actor)(batch["next_observation"])
+            next_action_dist = jax.vmap(jax.vmap(train_state.actor))(batch["next_observation"])
             next_action_probs = next_action_dist.probs
             next_action_probs_log = jnp.log(next_action_probs + 1e-8)
             
-            q_1_target_outputs = jax.vmap(train_state.q_critic1_target)(batch["next_observation"])
-            q_2_target_outputs = jax.vmap(train_state.q_critic2_target)(batch["next_observation"])
+            q_1_target_outputs = jax.vmap(jax.vmap(train_state.q_critic1_target))(batch["next_observation"])
+            q_2_target_outputs = jax.vmap(jax.vmap(train_state.q_critic2_target))(batch["next_observation"])
 
             target = (next_action_probs * (jnp.minimum(q_1_target_outputs, q_2_target_outputs) - train_state.alpha() * next_action_probs_log)).sum(axis=-1)
             target = batch["reward"] + ~batch["done"] * config.gamma * target
@@ -328,9 +332,19 @@ def create_train_object(
         def train_step(runner_state, _):
 
             # Do rollout of single trajactory
-            runner_state, metric = lax.scan(
+            runner_state, transitions = lax.scan(
                 _env_step, runner_state, None, config.update_every // config.num_envs
             )
+            metric = {}
+
+            train_state, env_state, next_obsv, buffer_state, rng = runner_state
+            # restructure data to be sequences of shape (num_envs, num_steps, ...)
+            transitions = jax.tree_util.tree_map(
+                lambda x: jnp.swapaxes(x, 0, 1), transitions
+            )
+            buffer_state = buffer.add(buffer_state, transitions)
+
+            runner_state = (train_state, env_state, next_obsv, buffer_state, rng)
             runner_state, (q_1_loss, q_2_loss) = _update_step(runner_state)
             rng = runner_state[-1]
 
@@ -339,14 +353,13 @@ def create_train_object(
             metric["eval_rewards"] = eval_rewards
             metric["q_1_loss"] = q_1_loss
             metric["q_2_loss"] = q_2_loss
+            metric["time"] = env_state.timestep
 
             # Debugging mode from the copied logging wrapper
             if config.debug:
                 def callback(info):
-                    print(f'timestep={(info["timestep"][-1][0] * config.num_envs)}, eval rewards={info["eval_rewards"]}')
+                    print(f'timestep={(info["time"][0] * config.num_envs)}, eval rewards={info["eval_rewards"]}')
                 jax.debug.callback(callback, metric)
-
-            
 
             return runner_state, metric 
         
@@ -365,7 +378,7 @@ def create_train_object(
     return train_func
 
 if __name__ == "__main__":
-    num_envs = 6
+    num_envs = 4
     env_name = "CartPole-v1"
     env, env_params = gymnax.make(env_name)
     train_func = create_train_object(
@@ -378,6 +391,6 @@ if __name__ == "__main__":
     )
     train_func_jit = eqx.filter_jit(train_func, backend="cpu")
     out = train_func_jit()
-    info = out["metrics"]
-    return_values = info["returned_episode_returns"][info["returned_episode"]]
-    timesteps = info["timestep"][info["returned_episode"]] * num_envs
+    # info = out["metrics"]
+    # return_values = info["returned_episode_returns"][info["returned_episode"]]
+    # timesteps = info["timestep"][info["returned_episode"]] * num_envs
