@@ -37,7 +37,7 @@ Most algorithm code lives in a single file under the `algorithms` folder; Howeve
 
 ## License
 
-Distributed under the MIT License. See `LICENSE.txt` for more information.
+Distributed under the MIT License. See `LICENSE` for more information.
 
 <!-- MARKDOWN LINKS & IMAGES -->
 <!-- https://www.markdownguide.org/basic-syntax/#reference-style-links -->
@@ -50,4 +50,4 @@ Distributed under the MIT License. See `LICENSE.txt` for more information.
 [issues-shield]: https://img.shields.io/github/issues/ponseko/rl-implementations.svg?style=for-the-badge
 [issues-url]: https://github.com/ponseko/rl-implementations/issues
 [license-shield]: https://img.shields.io/github/license/ponseko/rl-implementations.svg?style=for-the-badge
-[license-url]: https://github.com/ponseko/rl-implementations/blob/main/LICENSE.txt
+[license-url]: https://github.com/ponseko/rl-implementations/blob/main/LICENSE
