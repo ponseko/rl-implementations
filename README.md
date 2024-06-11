@@ -1,7 +1,4 @@
 
-[![Stargazers][stars-shield]][stars-url]
-[![MIT License][license-shield]][license-url]
-
 <br />
 <div align="center">
 
