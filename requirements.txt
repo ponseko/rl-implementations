@@ -1,0 +1,14 @@
+chex==0.1.86
+distrax==0.1.5
+equinox==0.11.4
+flashbax==0.1.2
+gymnax==0.0.8
+optax==0.2.2
+
+# For cpu only:
+jax[cuda12]==0.4.29
+
+# For cuda enabled devices you may want to install instead:
+# --pre
+# --find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+# jax[cuda12]==0.4.29
