@@ -92,15 +92,7 @@ def create_train_object(
         ),
     )
 
-    q1_optimizer = optax.chain(
-        optax.clip_by_global_norm(config.max_grad_norm),
-        optax.adam(
-            learning_rate=linear_schedule if config.anneal_learning_rate else config.learning_rate,
-            eps=1e-5
-        ),
-    )
-
-    q2_optimizer = optax.chain(
+    q_optimizer = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
         optax.adam(
             learning_rate=linear_schedule if config.anneal_learning_rate else config.learning_rate,
@@ -123,8 +115,8 @@ def create_train_object(
     alpha = Alpha(config.alpha)
 
     actor_optimizer_state = actor_optimizer.init(actor)
-    q1_optimizer_state = q1_optimizer.init(q_critic1)
-    q2_optimizer_state = q2_optimizer.init(q_critic2)
+    q1_optimizer_state = q_optimizer.init(q_critic1)
+    q2_optimizer_state = q_optimizer.init(q_critic2)
     alpha_optimizer_state = alpha_optimzer.init(alpha)
 
     train_state = TrainState(
@@ -243,7 +235,9 @@ def create_train_object(
                 q_2_outputs_curr = jax.vmap(new_critic2)(batch["observation"])
                 q_values_curr = jnp.minimum(q_1_outputs_curr, q_2_outputs_curr)
 
-                loss = -jnp.mean(curr_action_probs * (q_values_curr - (train_state.alpha() * curr_action_probs_log)))
+                loss = -jnp.mean(
+                    (curr_action_probs * (q_values_curr - (train_state.alpha() * curr_action_probs_log))).sum(axis=-1)
+                )
 
                 return loss, (curr_action_probs, curr_action_probs_log)
             
@@ -283,8 +277,8 @@ def create_train_object(
             # Updating Q networks
             q_1_loss, q_1_grads = __sac_qnet_loss(params=train_state.q_critic1, batch=batch)
             q_2_loss, q_2_grads = __sac_qnet_loss(params=train_state.q_critic2, batch=batch)
-            updates_q1, q1_optimizer_state = q1_optimizer.update(q_1_grads, train_state.q1_optimizer_state)
-            updates_q2, q2_optimizer_state = q2_optimizer.update(q_2_grads, train_state.q2_optimizer_state)
+            updates_q1, q1_optimizer_state = q_optimizer.update(q_1_grads, train_state.q1_optimizer_state)
+            updates_q2, q2_optimizer_state = q_optimizer.update(q_2_grads, train_state.q2_optimizer_state)
             new_critic1 = optax.apply_updates(train_state.q_critic1, updates_q1)
             new_critic2 = optax.apply_updates(train_state.q_critic2, updates_q2)
 
